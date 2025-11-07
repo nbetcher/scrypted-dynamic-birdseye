@@ -1,0 +1,63 @@
+{
+  "name": "scrypted-birdseye-seamless",
+  "version": "0.7.6",
+  "description": "Scrypted plugin: seamless single-stream birdseye with prebuffer-based switching and HW-accelerated encoding (QSV→VAAPI→CPU).",
+  "license": "MIT",
+  "author": "Nick Betcher <nick@nickbetcher.com>",
+  "type": "commonjs",
+  "main": "dist/main.cjs",
+  "scripts": {
+    "clean": "rimraf dist out || rm -rf dist out",
+    "scrypted-webpack": "scrypted-webpack",
+    "scrypted-deploy": "scrypted-deploy",
+    "scrypted-debug": "scrypted-debug",
+    "webpack": "npm run scrypted-webpack",
+    "watch": "scrypted-webpack --watch",
+    "build": "npm run clean && npm run scrypted-webpack",
+    "deploy": "npm run build && npm run scrypted-deploy --",
+    "debug": "npm run build && npm run scrypted-debug --",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "format": "prettier -w ."
+  },
+  "keywords": [
+    "scrypted",
+    "home-assistant",
+    "birdseye",
+    "ffmpeg",
+    "prebuffer",
+    "qsv",
+    "vaapi",
+    "mpegts",
+    "webpack"
+  ],
+  "peerDependencies": {
+    "@scrypted/sdk": "^0.5.48"
+  },
+  "dependencies": {
+    "@scrypted/common": "file:../scrypted/common",
+    "@scrypted/sdk": "^0.5.48"
+  },
+  "devDependencies": {
+    "@scrypted/sdk": "^0.5.48",
+    "@types/node": "^22.18.6",
+    "esbuild": "^0.25.11",
+    "esbuild-loader": "^4.4.0",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.9.3",
+    "webpack": "^5.102.1",
+    "webpack-cli": "^6.0.1"
+  },
+  "scrypted": {
+    "name": "Birdseye (Seamless, HW-aware)",
+    "readme": "README.md",
+    "type": "API",
+    "realfs": true,
+    "interfaces": [
+      "Settings",
+      "DeviceProvider",
+      "VideoCamera",
+      "HttpRequestHandler"
+    ],
+    "pluginDependencies": []
+  }
+}

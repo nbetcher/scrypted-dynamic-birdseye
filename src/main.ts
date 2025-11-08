@@ -1,14 +1,15 @@
 /**
  * scrypted-dynamic-birdseye (seamless-first, defensive)
+ *
  * - Dynamic single-stream virtual camera that switches to the most relevant camera
  *   based on ObjectDetector events with EMA + priorities + hysteresis + backoff.
  * - Defensive against SDK/API shape differences across Scrypted versions.
- * - Compatible with scrypted-webpack/ts-loader Node16 module semantics.
+ * - Compatible with scrypted-webpack/ts-loader Node16+ module semantics.
  *
- * Notes:
- * - Uses prebuffer hints in RequestMediaStreamOptions if available (best-effort).
- * - All HTTP response writes go through helpers that tolerate different HttpResponse shapes.
- * - All VideoCamera calls are guarded and narrowed before use.
+ * UI goals:
+ * - Monitored Cameras: dropdown of devices that look like they can emit detections.
+ * - Default Camera: dropdown of actual video cameras.
+ * - If default is empty but monitored has at least one video camera, auto-pick the first one.
  */
 
 import {
@@ -25,11 +26,23 @@ import {
 } from '@scrypted/sdk';
 
 /* --------------------------------- Globals --------------------------------- */
-
-const deviceManager = (globalThis as any).deviceManager;
-const systemManager = (globalThis as any).systemManager;
-const endpointManager = (globalThis as any).endpointManager;
-const mediaManager = (globalThis as any).mediaManager;
+/**
+ * Do NOT capture these once at module load. Always read them from globalThis
+ * so calls coming from other plugins (prebuffer, rebroadcast, etc.) see
+ * the real managers.
+ */
+function getDeviceManager() {
+  return (globalThis as any).deviceManager;
+}
+function getSystemManager() {
+  return (globalThis as any).systemManager;
+}
+function getEndpointManager() {
+  return (globalThis as any).endpointManager;
+}
+function getMediaManager() {
+  return (globalThis as any).mediaManager;
+}
 
 function now() {
   return Date.now();
@@ -52,8 +65,11 @@ const MAX_ERROR_LOG = 200;
 const DEFAULT_RETRY_INTERVAL_MS = 60_000;
 const DEFAULT_ENDPOINT_REFRESH_MS = 3_600_000;
 
-const DEFAULT_WIDTH = 1280;
-const DEFAULT_HEIGHT = 720;
+// bump to 1080p
+const DEFAULT_WIDTH = 1920;
+const DEFAULT_HEIGHT = 1080;
+// 2 Mbps target
+const DEFAULT_BITRATE = 2_000_000;
 
 /* --------------------------------- Types ----------------------------------- */
 
@@ -71,15 +87,20 @@ type ActiveDetection = {
   finalScore: number;
 };
 
-// Scrypted storage can be slightly different across environments, so describe minimally.
 type SimpleStorage = {
   getItem(key: string): string | null | undefined;
   setItem(key: string, value: string): void;
   removeItem?(key: string): void;
 };
 
-// Timer type that works even if Node types are not available.
 type TimeoutHandle = ReturnType<typeof setTimeout>;
+
+type NormalizedDeviceInfo = {
+  id: string;
+  name: string;
+  type?: string;
+  interfaces: string[];
+};
 
 /* ------------------------------ HTTP helpers ------------------------------- */
 
@@ -128,24 +149,14 @@ function redirect(res: any, url: string) {
 
 /* ------------------------- System/device helpers --------------------------- */
 
-/**
- * Scrypted's system state can look different across versions.
- * Normalize it here so the rest of the code can assume a simple shape.
- */
 function getSystemState(): any {
+  const sm = getSystemManager();
   try {
-    return (systemManager as any)?.getSystemState ? (systemManager as any).getSystemState() : {};
+    return sm?.getSystemState ? sm.getSystemState() : {};
   } catch {
     return {};
   }
 }
-
-type NormalizedDeviceInfo = {
-  id: string;
-  name: string;
-  type?: string;
-  interfaces: string[];
-};
 
 function normalizeDeviceEntry(id: string, entry: any): NormalizedDeviceInfo {
   const name =
@@ -154,8 +165,6 @@ function normalizeDeviceEntry(id: string, entry: any): NormalizedDeviceInfo {
   const type =
     (entry?.type && typeof entry.type === 'object' && 'value' in entry.type ? entry.type.value : entry?.type) ||
     undefined;
-
-  // interfaces can come as array, map, or { value: [] }
   let interfaces: string[] = [];
   const rawIfaces = entry?.interfaces?.value ?? entry?.interfaces;
   if (Array.isArray(rawIfaces)) {
@@ -163,7 +172,6 @@ function normalizeDeviceEntry(id: string, entry: any): NormalizedDeviceInfo {
   } else if (rawIfaces && typeof rawIfaces === 'object') {
     interfaces = Object.keys(rawIfaces);
   }
-
   return { id, name, type, interfaces };
 }
 
@@ -176,10 +184,43 @@ function listSystemDevices(): NormalizedDeviceInfo[] {
   return out;
 }
 
+/**
+ * Robustly get interfaces for a device id.
+ * Tries live device first, then system state.
+ */
+function getDeviceInterfaces(id: string): string[] {
+  const sm = getSystemManager();
+  const dev = sm?.getDeviceById?.(id);
+  const live = (dev as any)?.interfaces;
+  if (Array.isArray(live)) return live;
+  if (live && typeof live === 'object') return Object.keys(live);
+
+  const state = getSystemState();
+  const entry = state?.[id];
+  if (entry?.interfaces) {
+    const raw = entry.interfaces.value ?? entry.interfaces;
+    if (Array.isArray(raw)) return raw;
+    if (raw && typeof raw === 'object') return Object.keys(raw);
+  }
+
+  return [];
+}
+
+function formatDeviceChoice(d: { id: string; name: string }): string {
+  return `${d.name} (${d.id})`;
+}
+
+function parseDeviceChoice(v: string): string {
+  const m = /\(([^)]+)\)$/.exec(v);
+  if (m && m[1]) {
+    return m[1];
+  }
+  return v;
+}
+
 /* =============================== Provider ================================== */
 
 class DynamicCameraProvider extends ScryptedDeviceBase implements DeviceProvider {
-  // must be union, we set it to undefined in releaseDevice
   private deviceInstance: BirdseyeDevice | undefined;
 
   constructor(nativeId?: string) {
@@ -189,10 +230,10 @@ class DynamicCameraProvider extends ScryptedDeviceBase implements DeviceProvider
 
   private async discoverDevice() {
     try {
-      if (!deviceManager?.onDeviceDiscovered) {
-        /* fallback for older Scrypted versions */
-        if (deviceManager?.onDevicesChanged) {
-          await deviceManager.onDevicesChanged({
+      const dm = getDeviceManager();
+      if (!dm?.onDeviceDiscovered) {
+        if (dm?.onDevicesChanged) {
+          await dm.onDevicesChanged({
             devices: [
               {
                 nativeId: NATIVE_ID,
@@ -205,7 +246,7 @@ class DynamicCameraProvider extends ScryptedDeviceBase implements DeviceProvider
         }
         return;
       }
-      await deviceManager.onDeviceDiscovered({
+      await dm.onDeviceDiscovered({
         nativeId: NATIVE_ID,
         name: 'Dynamic Birdseye',
         interfaces: [ScryptedInterface.VideoCamera, ScryptedInterface.Settings],
@@ -230,7 +271,6 @@ class DynamicCameraProvider extends ScryptedDeviceBase implements DeviceProvider
     }
   }
 
-  // Optional HTTP status/telemetry endpoints (handled here to keep device clean)
   async onRequest(request: any, response: any) {
     try {
       const dev = (await this.getDevice(NATIVE_ID)) as BirdseyeDevice | undefined;
@@ -247,8 +287,9 @@ class DynamicCameraProvider extends ScryptedDeviceBase implements DeviceProvider
       if (path === '' || path.startsWith('status')) {
         let devicePath = '';
         try {
-          if (endpointManager?.getAuthenticatedPath) devicePath = await endpointManager.getAuthenticatedPath(NATIVE_ID);
-          else if (endpointManager?.getPath) devicePath = await endpointManager.getPath(NATIVE_ID);
+          const em = getEndpointManager();
+          if (em?.getAuthenticatedPath) devicePath = await em.getAuthenticatedPath(NATIVE_ID);
+          else if (em?.getPath) devicePath = await em.getPath(NATIVE_ID);
         } catch {}
         sendJSON(response, 200, { devicePath, telemetry: dev.getTelemetry() });
         return;
@@ -283,16 +324,13 @@ class DynamicCameraProvider extends ScryptedDeviceBase implements DeviceProvider
 /* ============================== Device ===================================== */
 
 class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings {
-  // listeners
   private listeners: any[] = [];
   private activeDetections: Map<string, ActiveDetection> = new Map();
 
-  // EMA persistence
   private emaMap: { [id: string]: number } = {};
   private emaPersistTimer: TimeoutHandle | undefined;
   private emaPersistDebounceMs = 4_000;
 
-  // configuration (persisted)
   private monitoredCameraIds: string[] = [];
   private defaultCameraId: string | undefined;
 
@@ -309,33 +347,25 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   private cameraPriorities: { [id: string]: number } = {};
 
   private autoDetectObjectDetectors = true;
-
-  // prebuffer hints (best-effort)
   private prebufferMs = 3000;
 
-  // diagnostics
   private failedListenerIds: string[] = [];
   private droppedMonitoredIds: string[] = [];
 
-  // endpoints
   private persistedEndpointPath: string | undefined;
   private persistedEndpointAuthPath: string | undefined;
 
-  // timers
   private retryIntervalMs = DEFAULT_RETRY_INTERVAL_MS;
   private retryTimer: TimeoutHandle | undefined;
   private endpointRefreshIntervalMs = DEFAULT_ENDPOINT_REFRESH_MS;
   private endpointRefreshTimer: TimeoutHandle | undefined;
   private idleTimer: TimeoutHandle | undefined;
 
-  // error persistence
   private errorLog: Array<{ ts: number; message: string; ctx?: any }> = [];
 
-  // programmatic rebroadcast (best-effort)
   private autoCreateRebroadcast = false;
   private rebroadcastDeviceId: string | undefined;
 
-  // switching state
   private lastSwitchTimestamp = 0;
   private currentActiveCameraId: string | undefined;
 
@@ -350,19 +380,27 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     try {
       this.loadConfiguration();
       this.loadPersistedEMA();
-      this.scrubEmaForMissingDevices(); // keep EMA map aligned to current system
+      this.scrubEmaForMissingDevices();
       this.loadFailedListeners();
       this.loadErrorLog();
       this.initializeListeners();
-      if (!this.defaultCameraId && this.monitoredCameraIds?.length) this.defaultCameraId = this.monitoredCameraIds[0];
+      if (!this.defaultCameraId && this.monitoredCameraIds?.length) {
+        // pick first monitored that is actually a VideoCamera
+        const firstVid = this.monitoredCameraIds.find((id) => {
+          const ifaces = getDeviceInterfaces(id);
+          return ifaces.includes(ScryptedInterface.VideoCamera);
+        });
+        this.defaultCameraId = firstVid || this.monitoredCameraIds[0];
+      }
       if (!this.currentActiveCameraId) this.currentActiveCameraId = this.defaultCameraId;
-      this.activeDetections.clear(); // scrub-on-start so old events don't drive camera
+      this.activeDetections.clear();
       this.resetIdleTimer();
       this.startRetryTimer();
       this.startEndpointRefreshTimer();
 
-      if (this.autoCreateRebroadcast)
+      if (this.autoCreateRebroadcast) {
         this.attemptCreateRebroadcast().catch((e) => this.logError('attemptCreateRebroadcast', e));
+      }
     } catch (e) {
       this.logError('safeInit', e);
     }
@@ -417,65 +455,47 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         needListenerRefresh = true;
       }
 
+      // monitored cameras comes from the dropdown as names like "Front Door (123)"
       if (values['monitoredCameras'] !== undefined) {
-        const raw = String(values['monitoredCameras'] || '').trim();
-        const tokens = raw.length ? raw.split(',').map((s: string) => s.trim()).filter(Boolean) : [];
-        const validIds: string[] = [];
-        const dropped: string[] = [];
+        const raw = values['monitoredCameras'];
+        let selected: string[] = [];
 
-        for (const t of tokens) {
-          const id = this.resolveDeviceId(t);
-          if (!id) {
-            dropped.push(t);
-            continue;
-          }
-          const dev = (systemManager as any).getDeviceById?.(id);
-          const ifaces: string[] = Array.isArray((dev as any)?.interfaces) ? (dev as any).interfaces : [];
-          if (!dev || !ifaces.includes(ScryptedInterface.ObjectDetector)) {
-            dropped.push(t);
-            continue;
-          }
-          validIds.push(id);
+        if (Array.isArray(raw)) {
+          selected = raw.map((s) => parseDeviceChoice(String(s))).filter(Boolean);
+        } else if (typeof raw === 'string') {
+          selected = raw
+            .split(',')
+            .map((s) => parseDeviceChoice(s.trim()))
+            .filter(Boolean);
         }
 
-        this.monitoredCameraIds = validIds;
+        this.monitoredCameraIds = selected;
         (this as any).storage.setItem('monitoredCameras', JSON.stringify(this.monitoredCameraIds));
-        this.droppedMonitoredIds = dropped;
-        if (dropped.length) (this as any).storage.setItem(DROPPED_MONITORED_KEY, JSON.stringify(dropped));
-        else (this as any).storage.removeItem?.(DROPPED_MONITORED_KEY);
-        needListenerRefresh = true;
+        // if default is missing but we have at least one monitored, set it later below
       }
 
       if (values['defaultCamera'] !== undefined) {
         const raw = String(values['defaultCamera'] || '').trim();
-        const id = raw ? this.resolveDeviceId(raw) : undefined;
-        if (id) {
-          const dev = (systemManager as any).getDeviceById?.(id);
-          const ifaces: string[] = Array.isArray((dev as any)?.interfaces) ? (dev as any).interfaces : [];
-          if (dev?.type === ScryptedDeviceType.Camera || ifaces.includes(ScryptedInterface.VideoCamera)) {
-            this.defaultCameraId = id;
-            (this as any).storage.setItem('defaultCamera', id);
-          } else {
-            console.warn(`defaultCamera '${raw}' resolved to '${id}' but is not a VideoCamera; ignoring`);
-          }
-        } else {
-          if (!raw) {
-            this.defaultCameraId = undefined;
-            (this as any).storage.setItem('defaultCamera', '');
-          } else {
-            console.warn(`defaultCamera '${raw}' could not be resolved; ignoring`);
-          }
-        }
+        const id = raw ? parseDeviceChoice(raw) : '';
+        this.defaultCameraId = id || undefined;
+        (this as any).storage.setItem('defaultCamera', this.defaultCameraId || '');
+      }
+
+      // ensure default is among monitored if possible
+      if ((!this.defaultCameraId || (this.monitoredCameraIds.length && !this.monitoredCameraIds.includes(this.defaultCameraId))) &&
+          this.monitoredCameraIds.length) {
+        this.defaultCameraId = this.monitoredCameraIds[0];
+        (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
       }
 
       if (values['detectionClasses'] !== undefined) {
-        const raw = String(values['detectionClasses'] || '').trim();
-        this.detectionClasses = raw.length
+        const raw = values['detectionClasses'];
+        const arr: string[] = Array.isArray(raw)
           ? raw
-              .split(',')
-              .map((s: string) => s.trim().toLowerCase())
-              .filter(Boolean)
+          : typeof raw === 'string'
+          ? raw.split(',').map((s) => s.trim()).filter(Boolean)
           : ['person', 'vehicle'];
+        this.detectionClasses = arr.map((s) => s.toLowerCase());
         (this as any).storage.setItem('detectionClasses', JSON.stringify(this.detectionClasses));
       }
 
@@ -553,12 +573,21 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           this.attemptCreateRebroadcast().catch((e) => this.logError('autoCreateRebroadcast', e));
       }
 
-      // finalize
-      this.loadConfiguration(); // re-sync with storage just in case shapes changed
+      // After user changes monitored list, make sure default is sane
+      if ((!this.defaultCameraId || !this.monitoredCameraIds.includes(this.defaultCameraId)) && this.monitoredCameraIds.length) {
+        // pick first monitored that is an actual VideoCamera
+        const vid = this.monitoredCameraIds.find((id) => getDeviceInterfaces(id).includes(ScryptedInterface.VideoCamera));
+        this.defaultCameraId = vid || this.monitoredCameraIds[0];
+        (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
+      }
+
+      this.loadConfiguration();
       this.scrubEmaForMissingDevices();
+
       if (needListenerRefresh) {
         this.initializeListeners();
       }
+
       this.resetIdleTimer();
       await this.persistEndpointPaths();
     } catch (e) {
@@ -568,62 +597,77 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
   async getSettings(): Promise<Setting[]> {
     try {
-      const base: Setting[] = [];
+      const devices = listSystemDevices();
+      const haveDevices = devices && devices.length > 0;
 
-      if ((!this.defaultCameraId) && (!this.monitoredCameraIds || this.monitoredCameraIds.length === 0)) {
-        base.push({
-          title: '⚠️ No stream target',
-          key: 'noTarget',
-          type: 'string',
-          readonly: true,
-          value: 'No default camera and no monitored cameras are set. At least one must be configured.',
-        });
-      }
-      if (this.droppedMonitoredIds?.length) {
-        base.push({
-          title: '⚠️ Invalid monitored cameras dropped',
-          key: 'droppedMonitored',
-          type: 'string',
-          readonly: true,
-          value: `Dropped: ${this.droppedMonitoredIds.join(', ')}`,
-          description: 'These entries were rejected (not found or missing ObjectDetector).',
-        });
-      }
-      if (this.failedListenerIds?.length) {
-        base.push({
-          title: '⚠️ Listener Errors',
-          key: 'listenerWarning',
-          type: 'string',
-          readonly: true,
-          value: `Failed to register listeners for: ${this.failedListenerIds.join(', ')}`,
-          description: 'These cameras are configured but not monitoring detections. Verify ObjectDetector is enabled.',
-        });
+      const settings: Setting[] = [];
+
+      if (haveDevices) {
+        // cameras you can monitor (be generous)
+        const monitorable = devices.filter((d) =>
+          d.type === ScryptedDeviceType.Camera ||
+          d.interfaces.includes(ScryptedInterface.VideoCamera) ||
+          d.interfaces.includes(ScryptedInterface.ObjectDetector)
+        );
+        // cameras you can stream from (video-ish)
+        const videoish = devices.filter((d) =>
+          d.type === ScryptedDeviceType.Camera ||
+          d.interfaces.includes(ScryptedInterface.VideoCamera)
+        );
+
+        settings.push(
+          {
+            title: 'Monitored Cameras',
+            key: 'monitoredCameras',
+            type: 'string',
+            multiple: true,
+            choices: monitorable.map(formatDeviceChoice),
+            value: this.monitoredCameraIds
+              .map((id) => {
+                const d = devices.find((x) => x.id === id);
+                return d ? formatDeviceChoice(d) : id;
+              })
+              .filter(Boolean),
+          },
+          {
+            title: 'Default Camera',
+            key: 'defaultCamera',
+            type: 'string',
+            choices: videoish.map(formatDeviceChoice),
+            value: (() => {
+              if (!this.defaultCameraId) return '';
+              const d = devices.find((x) => x.id === this.defaultCameraId);
+              return d ? formatDeviceChoice(d) : this.defaultCameraId;
+            })(),
+          },
+        );
+      } else {
+        // very early / system not ready – show plain fields so it’s never blank
+        settings.push(
+          {
+            title: 'Monitored Cameras',
+            key: 'monitoredCameras',
+            type: 'string',
+            value: this.monitoredCameraIds.join(','),
+          },
+          {
+            title: 'Default Camera',
+            key: 'defaultCamera',
+            type: 'string',
+            value: this.defaultCameraId || '',
+          },
+        );
       }
 
-      base.push(
+      // rest: detection etc.
+      settings.push(
         {
-          title: 'Auto-detect ObjectDetector cameras',
-          key: 'autoDetectObjectDetectors',
-          type: 'boolean',
-          value: String(this.autoDetectObjectDetectors),
-        },
-        {
-          title: 'Monitored Cameras (IDs or Names, comma-separated)',
-          key: 'monitoredCameras',
-          type: 'string',
-          value: this.monitoredCameraIds.join(','),
-        },
-        {
-          title: 'Default Camera (ID or Name)',
-          key: 'defaultCamera',
-          type: 'string',
-          value: this.defaultCameraId || '',
-        },
-        {
-          title: 'Detection Classes (comma-separated)',
+          title: 'Detection Classes',
           key: 'detectionClasses',
           type: 'string',
-          value: this.detectionClasses.join(','),
+          multiple: true,
+          choices: ['person', 'vehicle', 'car', 'package', 'face'],
+          value: this.detectionClasses,
         },
         {
           title: 'Smoothing factor (EMA alpha 0..1)',
@@ -669,33 +713,14 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           description: 'auto|h264|h265',
         },
         {
-          title: 'Camera priorities (JSON map: idOrName -> number)',
-          key: 'cameraPriorities',
-          type: 'string',
-          value: JSON.stringify(this.cameraPriorities, null, 2),
-        },
-        {
           title: 'Prebuffer (ms, hint)',
           key: 'prebufferMs',
           type: 'number',
           value: String(this.prebufferMs),
         },
-        {
-          title: 'Rebroadcast endpoint (info)',
-          key: 'rebroadcastInfo',
-          type: 'string',
-          readonly: true,
-          value: this.persistedEndpointAuthPath || this.persistedEndpointPath || '(not yet persisted)',
-        },
-        {
-          title: 'Auto-create Rebroadcast device (best-effort, opt-in)',
-          key: 'autoCreateRebroadcast',
-          type: 'boolean',
-          value: String(this.autoCreateRebroadcast),
-        }
       );
 
-      return base;
+      return settings;
     } catch (e: any) {
       this.logError('getSettings', e);
       return [
@@ -715,7 +740,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   private normalizeDurationFromStorage(n: number | undefined, fallback: number): number {
     if (!Number.isFinite(n as number)) return fallback;
     const v = n as number;
-    // if it's clearly in seconds (like 30), convert to ms
     if (v > 0 && v < 10000) return v * 1000;
     return v;
   }
@@ -843,17 +867,17 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       const devices = listSystemDevices();
       const ids: string[] = [];
       for (const d of devices) {
-        if (
-          (d.type === ScryptedDeviceType.Camera || d.interfaces.includes(ScryptedInterface.ObjectDetector)) &&
-          d.interfaces.includes(ScryptedInterface.ObjectDetector)
-        ) {
+        if (d.interfaces.includes(ScryptedInterface.ObjectDetector)) {
           ids.push(d.id);
         }
       }
       if (ids.length) {
         this.monitoredCameraIds = ids;
         (this as any).storage.setItem('monitoredCameras', JSON.stringify(ids));
-        if (!this.defaultCameraId) this.defaultCameraId = ids[0];
+        if (!this.defaultCameraId) {
+          const vid = ids.find((id) => getDeviceInterfaces(id).includes(ScryptedInterface.VideoCamera));
+          this.defaultCameraId = vid || ids[0];
+        }
       }
     } catch (e) {
       this.logError('populateAutoDetectedCameras', e);
@@ -872,30 +896,21 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     }
     this.failedListenerIds = [];
 
-    if ((!this.monitoredCameraIds?.length) && this.autoDetectObjectDetectors) this.populateAutoDetectedCameras();
+    if ((!this.monitoredCameraIds?.length) && this.autoDetectObjectDetectors) {
+      this.populateAutoDetectedCameras();
+    }
 
     if (!this.monitoredCameraIds?.length) {
-      console.log('Dynamic Birdseye: no monitored cameras configured.');
       this.persistFailedListeners();
       return;
     }
 
+    const sm = getSystemManager();
+
     for (const id of this.monitoredCameraIds) {
       try {
-        const dev = (systemManager as any).getDeviceById?.(id);
-        const ifaces: string[] = Array.isArray((dev as any)?.interfaces) ? (dev as any).interfaces : [];
-        if (!dev) {
-          console.warn(`monitored ${id} not found`);
-          this.failedListenerIds.push(id);
-          continue;
-        }
-        if (!ifaces.includes(ScryptedInterface.ObjectDetector)) {
-          console.warn(`monitored ${id} has no ObjectDetector`);
-          this.failedListenerIds.push(id);
-          continue;
-        }
-
-        const listener = (systemManager as any).listenDevice?.(
+        // don’t pre-check interfaces; just try to listen
+        const listener = sm?.listenDevice?.(
           id,
           ScryptedInterface.ObjectDetector,
           (source: any, details: any, data: any) => {
@@ -906,11 +921,12 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
             }
           }
         );
+
         if (!listener) {
-          console.warn(`listenDevice returned falsy for ${id}`);
           this.failedListenerIds.push(id);
           continue;
         }
+
         this.listeners.push(listener);
       } catch (e) {
         this.logError('initializeListeners', e);
@@ -934,27 +950,24 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
   private async retryFailedListeners() {
     if (!this.failedListenerIds?.length) return;
+    const sm = getSystemManager();
     const toTry = [...this.failedListenerIds];
     const recovered: string[] = [];
 
     for (const id of toTry) {
       try {
-        const dev = (systemManager as any).getDeviceById?.(id);
-        const ifaces: string[] = Array.isArray((dev as any)?.interfaces) ? (dev as any).interfaces : [];
+        const dev = sm?.getDeviceById?.(id);
+        const ifaces = getDeviceInterfaces(id);
         if (!dev) continue;
         if (!ifaces.includes(ScryptedInterface.ObjectDetector)) continue;
 
-        const listener = (systemManager as any).listenDevice?.(
-          id,
-          ScryptedInterface.ObjectDetector,
-          (source: any, details: any, data: any) => {
-            try {
-              this.handleObjectDetection(source, details, data as ObjectsDetected);
-            } catch (e) {
-              this.logError('listenerCallback', e);
-            }
+        const listener = sm?.listenDevice?.(id, ScryptedInterface.ObjectDetector, (source: any, details: any, data: any) => {
+          try {
+            this.handleObjectDetection(source, details, data as ObjectsDetected);
+          } catch (e) {
+            this.logError('listenerCallback', e);
           }
-        );
+        });
         if (listener) {
           this.listeners.push(listener);
           recovered.push(id);
@@ -967,7 +980,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     if (recovered.length) {
       this.failedListenerIds = this.failedListenerIds.filter((x) => !recovered.includes(x));
       this.persistFailedListeners();
-      console.log('Dynamic Birdseye: Recovered listeners:', recovered.join(', '));
     }
   }
 
@@ -1065,9 +1077,10 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
   private async persistEndpointPaths() {
     try {
+      const em = getEndpointManager();
       try {
-        if (endpointManager?.getAuthenticatedPath) {
-          const p = await endpointManager.getAuthenticatedPath(NATIVE_ID);
+        if (em?.getAuthenticatedPath) {
+          const p = await em.getAuthenticatedPath(NATIVE_ID);
           if (p) {
             this.persistedEndpointAuthPath = p;
             (this as any).storage.setItem(ENDPOINT_AUTH_PATH_KEY, p);
@@ -1075,8 +1088,8 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         }
       } catch {}
       try {
-        if (endpointManager?.getPath) {
-          const p = await endpointManager.getPath(NATIVE_ID);
+        if (em?.getPath) {
+          const p = await em.getPath(NATIVE_ID);
           if (p) {
             this.persistedEndpointPath = p;
             (this as any).storage.setItem(ENDPOINT_PATH_KEY, p);
@@ -1092,7 +1105,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
   private handleObjectDetection(eventSource: any, _details: any, eventData: ObjectsDetected) {
     try {
-      // Some Scrypted versions may pass the actual device; others pass an object with { id, name }.
       const deviceId = eventSource?.id || _details?.id;
       const deviceName = eventSource?.name || _details?.name || deviceId || 'unknown';
       if (!deviceId) return;
@@ -1106,23 +1118,20 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         return;
       }
 
-      // make the element shape non-optional for className so TS does not complain with exactOptionalPropertyTypes
-      type RelevantDetection = { className: string; score: number };
-
-      const relevant: RelevantDetection[] = detections
-        .filter(
-          (d) =>
-            d &&
-            typeof d.className === 'string' &&
-            this.detectionClasses.includes(String(d.className).toLowerCase())
-        )
-        .map((d) => ({
-          className: d.className as string,
-          score: Math.max(0, Math.min(1, Number(d.score || 0))),
-        }));
+      // build relevant list but do NOT emit className: undefined (to appease exactOptionalPropertyTypes)
+      const relevant: Array<{ score: number; className?: string }> = [];
+      for (const d of detections) {
+        if (!d) continue;
+        const cnameRaw = typeof d.className === 'string' ? d.className : undefined;
+        const cname = cnameRaw ? cnameRaw.toLowerCase() : undefined;
+        if (!cname || !this.detectionClasses.includes(cname)) continue;
+        const scoreNum = Math.max(0, Math.min(1, Number(d.score || 0)));
+        const obj: { score: number; className?: string } = { score: scoreNum };
+        if (cnameRaw) obj.className = cnameRaw;
+        relevant.push(obj);
+      }
 
       if (!relevant.length) {
-        // no relevant classes: just stop tracking this camera
         if (this.activeDetections.has(deviceId)) {
           this.activeDetections.delete(deviceId);
           this.determineActiveCamera();
@@ -1130,16 +1139,12 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         return;
       }
 
-      // pick best score among relevant detections safely
-      let best: RelevantDetection | undefined = undefined;
+      // pick best manually
+      let best: { score: number; className?: string } | undefined = undefined;
       for (const r of relevant) {
-        if (!best || r.score > best.score) {
-          best = r;
-        }
+        if (!best || r.score > best.score) best = r;
       }
-
       if (!best) {
-        // extremely defensive: if the array turned out empty somehow, just drop tracking
         if (this.activeDetections.has(deviceId)) {
           this.activeDetections.delete(deviceId);
           this.determineActiveCamera();
@@ -1147,7 +1152,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         return;
       }
 
-      const rawScore = best.score || 0;
+      const rawScore = best.score;
       const prevEMA = typeof this.emaMap[deviceId] === 'number' ? this.emaMap[deviceId] : rawScore;
       const ema = this.detectionEMAAlpha * rawScore + (1 - this.detectionEMAAlpha) * prevEMA;
       this.emaMap[deviceId] = ema;
@@ -1222,16 +1227,15 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       }
     }
 
-    const dev = (systemManager as any).getDeviceById?.(targetId);
-    const ifaces: string[] = Array.isArray((dev as any)?.interfaces) ? (dev as any).interfaces : [];
+    const sm = getSystemManager();
+    const dev = sm?.getDeviceById?.(targetId);
+    const ifaces = getDeviceInterfaces(targetId);
 
-    // allow switch if it's a Camera OR has VideoCamera interface (some devices may not declare type)
     if (!dev || !((dev as any).type === ScryptedDeviceType.Camera || ifaces.includes(ScryptedInterface.VideoCamera)))
       return;
 
     this.currentActiveCameraId = targetId;
     this.lastSwitchTimestamp = t;
-    console.log('Dynamic Birdseye: Active camera switched to', (dev as any).name || targetId);
   }
 
   private resetIdleTimer() {
@@ -1266,6 +1270,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           codec: this.codecPreference === 'auto' ? undefined : this.codecPreference,
           width: DEFAULT_WIDTH,
           height: DEFAULT_HEIGHT,
+          bitrate: DEFAULT_BITRATE,
         } as any,
       },
     ];
@@ -1274,7 +1279,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
     const targetId = this.pickTargetId();
     const cam = this.getVideoCamera(targetId);
-
     const requestOptions: RequestMediaStreamOptions = this.buildRequestOptions(options);
 
     try {
@@ -1301,8 +1305,9 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   }
 
   private getVideoCamera(id: string): VideoCamera {
-    const devAny = (systemManager as any).getDeviceById?.(id);
-    const ifaces: string[] = Array.isArray((devAny as any)?.interfaces) ? (devAny as any).interfaces : [];
+    const sm = getSystemManager();
+    const devAny = sm?.getDeviceById?.(id);
+    const ifaces = getDeviceInterfaces(id);
     if (!devAny) throw new Error('target device missing');
     if (!ifaces.includes(ScryptedInterface.VideoCamera)) throw new Error('target not a VideoCamera');
     return devAny as unknown as VideoCamera;
@@ -1312,12 +1317,12 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     const videoBase: any = (base as any)?.video || {};
     const ro: RequestMediaStreamOptions = {
       ...base,
-      // Some Scrypted versions also look here for prebuffer, so set it too.
       prebuffer: (base as any)?.prebuffer ?? this.prebufferMs,
       video: {
         ...videoBase,
         width: videoBase.width || DEFAULT_WIDTH,
         height: videoBase.height || DEFAULT_HEIGHT,
+        bitrate: videoBase.bitrate || DEFAULT_BITRATE,
         codec: this.codecPreference !== 'auto' ? this.codecPreference : videoBase.codec,
         prebuffer: videoBase.prebuffer ?? this.prebufferMs,
       } as any,
@@ -1342,7 +1347,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       seq.push({ ...baseOptions, video: { ...(baseOptions as any).video, codec: 'h264' } });
       seq.push({ ...baseOptions, video: { ...(baseOptions as any).video, codec: 'h265' } });
     }
-    // final attempt with whatever the camera wants
     seq.push({ ...baseOptions, video: { ...(baseOptions as any).video } });
 
     let lastErr: any;
@@ -1361,10 +1365,11 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   }
 
   private async convertMediaObjectToLocalUrl(mediaObject: MediaObject, mime = 'video/mp4') {
-    if (mediaManager?.convertMediaObjectToLocalUrl) {
-      return await mediaManager.convertMediaObjectToLocalUrl(mediaObject, mime);
-    } else if (mediaManager?.convertMediaObjectToInsecureLocalUrl) {
-      return await mediaManager.convertMediaObjectToInsecureLocalUrl(mediaObject, mime);
+    const mm = getMediaManager();
+    if (mm?.convertMediaObjectToLocalUrl) {
+      return await mm.convertMediaObjectToLocalUrl(mediaObject, mime);
+    } else if (mm?.convertMediaObjectToInsecureLocalUrl) {
+      return await mm.convertMediaObjectToInsecureLocalUrl(mediaObject, mime);
     }
     throw new Error('mediaManager convert functions unavailable');
   }
@@ -1374,26 +1379,24 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   async attemptCreateRebroadcast(): Promise<boolean> {
     try {
       const devices = listSystemDevices();
-      // look for a device/plugin that looks like a rebroadcast handler
       const rebPlugin = devices.find((d) => (d.name || '').toLowerCase().includes('rebroadcast'));
       if (!rebPlugin) {
-        console.log('Dynamic Birdseye: Rebroadcast plugin not found for programmatic creation.');
         return false;
       }
 
+      const sm = getSystemManager();
       try {
-        const dev = (systemManager as any).getDeviceById?.(rebPlugin.id);
-        if (dev && typeof dev.createRebroadcast === 'function') {
+        const dev = sm?.getDeviceById?.(rebPlugin.id);
+        if (dev && typeof (dev as any).createRebroadcast === 'function') {
           const cfg = {
             name: 'Birdseye Rebroadcast',
             port: 8554,
             path: `/birdseye-${Math.floor(Math.random() * 9000) + 1000}`,
           };
-          const result = await dev.createRebroadcast(cfg);
+          const result = await (dev as any).createRebroadcast(cfg);
           if (result?.nativeId) {
             this.rebroadcastDeviceId = result.nativeId;
             (this as any).storage.setItem(REBROADCAST_DEVICE_KEY, this.rebroadcastDeviceId);
-            console.log('Dynamic Birdseye: programmatic rebroadcast created', result);
             return true;
           }
         }
@@ -1401,7 +1404,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         this.logError('attemptCreateRebroadcast.call', e);
       }
 
-      console.log('Dynamic Birdseye: programmatic rebroadcast creation failed (best-effort).');
       return false;
     } catch (e) {
       this.logError('attemptCreateRebroadcast', e);
@@ -1415,11 +1417,18 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     if (!input) return undefined;
     const devices = listSystemDevices();
 
-    // direct id match
+    // exact id
     const byId = devices.find((d) => d.id === input);
     if (byId?.id) return byId.id;
 
-    // name match (case-insensitive)
+    // handle "Name (id)" format
+    const parenMatch = input.match(/\(([^)]+)\)\s*$/);
+    if (parenMatch && parenMatch[1]) {
+      const innerId = parenMatch[1].trim();
+      const byInner = devices.find((d) => d.id === innerId);
+      if (byInner?.id) return byInner.id;
+    }
+
     const lower = input.trim().toLowerCase();
     const byName = devices.find((d) => (d.name || '').trim().toLowerCase() === lower);
     if (byName?.id) return byName.id;

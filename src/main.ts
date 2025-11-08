@@ -702,6 +702,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       const detectionSet = new Set(detectionDevices.map((d) => d.id));
       const monitoredIds = this.monitoredCameraIds.filter(Boolean);
       const monitoredInPicker = monitoredIds.filter((id) => detectionSet.has(id));
+      const missingMonitored = monitoredIds.filter((id) => id && !detectionSet.has(id));
 
       const defaultId =
         this.defaultCameraId &&
@@ -711,7 +712,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           : undefined;
 
       const settings: Setting[] = [];
-
+      
       settings.push(
         {
           title: 'Monitored Cameras',
@@ -737,6 +738,17 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           value: this.autoDetectObjectDetectors,
         },
       );
+
+      if (missingMonitored.length) {
+        settings.push({
+          title: '⚠️ Missing monitored cameras',
+          key: 'monitoredCamerasMissing',
+          type: 'string',
+          readonly: true,
+          description: 'These saved entries no longer expose ObjectDetector and are ignored.',
+          value: missingMonitored.join(', '),
+        });
+      }
 
       // rest: detection etc.
       const normalizedDetectionString = this.detectionClasses.join(',');
@@ -868,8 +880,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         const parsedDefault = parseDeviceChoice(String(defaultRaw));
         this.defaultCameraId = parsedDefault ? this.resolveDeviceId(parsedDefault) || parsedDefault : undefined;
       }
-
-      this.pruneMonitoredCamerasWithoutDetectors();
 
       const classesRaw = s.getItem('detectionClasses');
       if (classesRaw) {

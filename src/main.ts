@@ -54,7 +54,6 @@ const NATIVE_ID = 'dynamic-birdseye-v2';
 
 const EMA_STORAGE_KEY = 'emaMap_v2';
 const FAILED_LISTENERS_KEY = 'failedListeners_v2';
-const DROPPED_MONITORED_KEY = 'droppedMonitored_v2';
 const ERROR_LOG_KEY = 'errorLog_v2';
 
 const ENDPOINT_PATH_KEY = 'rebroadcastPath_v2';
@@ -348,7 +347,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   private prebufferMs = 3000;
 
   private failedListenerIds: string[] = [];
-  private droppedMonitoredIds: string[] = [];
 
   private persistedEndpointPath: string | undefined;
   private persistedEndpointAuthPath: string | undefined;
@@ -673,10 +671,11 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
       // After user changes monitored list, make sure default is sane
       if ((!this.defaultCameraId || !this.monitoredCameraIds.includes(this.defaultCameraId)) && this.monitoredCameraIds.length) {
-        // pick first monitored that is an actual VideoCamera
-        const vid = this.monitoredCameraIds.find((id) => getDeviceInterfaces(id).includes(ScryptedInterface.VideoCamera));
-        this.defaultCameraId = vid || this.monitoredCameraIds[0];
-        (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
+        const vid = this.monitoredCameraIds.find((id) => this.deviceHasVideoCapability(id));
+        if (vid) {
+          this.defaultCameraId = vid;
+          (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
+        }
       }
 
       this.loadConfiguration();
@@ -688,6 +687,9 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
       this.resetIdleTimer();
       await this.persistEndpointPaths();
+      try {
+        this.onDeviceEvent?.(ScryptedInterface.Settings, undefined);
+      } catch {}
     } catch (e) {
       this.logError('putSettings', e);
     }
@@ -713,7 +715,9 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           ? this.defaultCameraId
           : undefined;
 
-      const settings: Setting[] = [];
+      const detectionSet = new Set(detectionDevices.map((d) => d.id));
+      const monitoredIds = this.monitoredCameraIds.filter(Boolean);
+      const monitoredInPicker = monitoredIds.filter((id) => detectionSet.has(id));
 
       settings.push(
         {
@@ -992,6 +996,57 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     }
   }
 
+  private pruneMonitoredCamerasWithoutDetectors() {
+    try {
+      if (!this.monitoredCameraIds?.length) return;
+
+      const keep: string[] = [];
+      let changed = false;
+
+      for (const id of this.monitoredCameraIds) {
+        if (!id) continue;
+        if (this.deviceHasObjectDetector(id)) {
+          keep.push(id);
+          continue;
+        }
+        changed = true;
+      }
+
+      if (!changed) return;
+
+      this.monitoredCameraIds = keep;
+      (this as any).storage.setItem('monitoredCameras', JSON.stringify(keep));
+
+        if (this.defaultCameraId && !keep.includes(this.defaultCameraId)) {
+          if (keep.length) {
+            const nextDefault = keep.find((nextId) => this.deviceHasVideoCapability(nextId));
+            if (nextDefault) {
+              this.defaultCameraId = nextDefault;
+              (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
+            } else {
+              this.defaultCameraId = undefined;
+              try {
+                (this as any).storage.removeItem?.('defaultCamera');
+              } catch {}
+              if (!(this as any).storage.removeItem) {
+                (this as any).storage.setItem('defaultCamera', '');
+              }
+            }
+          } else {
+            this.defaultCameraId = undefined;
+            try {
+              (this as any).storage.removeItem?.('defaultCamera');
+            } catch {}
+            if (!(this as any).storage.removeItem) {
+              (this as any).storage.setItem('defaultCamera', '');
+            }
+          }
+        }
+    } catch (e) {
+      this.logError('pruneMonitoredCamerasWithoutDetectors', e);
+    }
+  }
+
   private initializeListeners() {
     try {
       for (const l of this.listeners) {
@@ -1126,11 +1181,8 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       if (!raw) this.failedListenerIds = [];
       else this.failedListenerIds = Array.isArray(JSON.parse(raw)) ? JSON.parse(raw) : [];
 
-      const droppedRaw = (this as any).storage.getItem(DROPPED_MONITORED_KEY);
-      this.droppedMonitoredIds = droppedRaw ? (Array.isArray(JSON.parse(droppedRaw)) ? JSON.parse(droppedRaw) : []) : [];
     } catch {
       this.failedListenerIds = [];
-      this.droppedMonitoredIds = [];
     }
   }
 
@@ -1320,9 +1372,17 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       }
     }
 
-    let targetId = cand
-      ? cand.cameraId
-      : this.defaultCameraId || (this.monitoredCameraIds?.length ? this.monitoredCameraIds[0] : undefined);
+    let targetId = cand ? cand.cameraId : undefined;
+    if (targetId && !this.tryResolveVideoCamera(targetId)) {
+      this.activeDetections.delete(targetId);
+      targetId = undefined;
+    }
+
+    if (!targetId) {
+      const fallback = this.enumerateVideoCameraCandidates()[0];
+      targetId = fallback?.id;
+    }
+
     if (!targetId) return;
     if (this.currentActiveCameraId === targetId) return;
     if (t - this.lastSwitchTimestamp < this.minSwitchDurationMs) return;
@@ -1335,12 +1395,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       }
     }
 
-    const sm = getSystemManager();
-    const dev = sm?.getDeviceById?.(targetId);
-    const ifaces = getDeviceInterfaces(targetId);
-
-    if (!dev || !((dev as any).type === ScryptedDeviceType.Camera || ifaces.includes(ScryptedInterface.VideoCamera)))
-      return;
+    if (!this.tryResolveVideoCamera(targetId)) return;
 
     this.currentActiveCameraId = targetId;
     this.lastSwitchTimestamp = t;
@@ -1351,7 +1406,16 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     this.idleTimer = setTimeout(() => {
       try {
         this.activeDetections.clear();
-        if (this.defaultCameraId) this.currentActiveCameraId = this.defaultCameraId;
+        const fallbackOrder = [this.defaultCameraId, ...(this.monitoredCameraIds || [])];
+        let reassigned: string | undefined;
+        for (const id of fallbackOrder) {
+          if (!id) continue;
+          if (this.tryResolveVideoCamera(id)) {
+            reassigned = id;
+            break;
+          }
+        }
+        this.currentActiveCameraId = reassigned;
       } catch (e) {
         this.logError('idleTimer', e);
       }
@@ -1361,13 +1425,30 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   /* -------------------------------- Streaming ------------------------------- */
 
   async getRebroadcastRedirectUrl(): Promise<{ url?: string }> {
-    const targetId = this.pickTargetId();
-    const cam = this.getVideoCamera(targetId);
+    const [target, ...fallbacks] = this.enumerateVideoCameraCandidates();
+    if (!target) throw new Error('No video-capable monitored camera available');
     const opts: RequestMediaStreamOptions = this.buildRequestOptions();
-    const mo: MediaObject = await this.tryGetStreamWithFallback(cam, opts);
-    const url = await this.convertMediaObjectToLocalUrl(mo);
-    await this.persistEndpointPaths();
-    return { url };
+    try {
+      const mo: MediaObject = await this.tryGetStreamWithFallback(target.camera, opts);
+      const url = await this.convertMediaObjectToLocalUrl(mo);
+      await this.persistEndpointPaths();
+      if (this.currentActiveCameraId !== target.id) this.currentActiveCameraId = target.id;
+      return { url };
+    } catch (e) {
+      this.logError('getRebroadcastRedirectUrl', e);
+      for (const fb of fallbacks) {
+        try {
+          const mo: MediaObject = await this.tryGetStreamWithFallback(fb.camera, opts);
+          const url = await this.convertMediaObjectToLocalUrl(mo);
+          await this.persistEndpointPaths();
+          if (this.currentActiveCameraId !== fb.id) this.currentActiveCameraId = fb.id;
+          return { url };
+        } catch (inner) {
+          this.logError('getRebroadcastRedirectUrl.fallback', inner);
+        }
+      }
+      throw e;
+    }
   }
 
   async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
@@ -1385,40 +1466,27 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   }
 
   async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
-    const targetId = this.pickTargetId();
-    const cam = this.getVideoCamera(targetId);
+    const [target, ...fallbacks] = this.enumerateVideoCameraCandidates();
+    if (!target) throw new Error('No video-capable monitored camera available');
     const requestOptions: RequestMediaStreamOptions = this.buildRequestOptions(options);
 
     try {
-      return await this.tryGetStreamWithFallback(cam, requestOptions);
+      const mo = await this.tryGetStreamWithFallback(target.camera, requestOptions);
+      if (this.currentActiveCameraId !== target.id) this.currentActiveCameraId = target.id;
+      return mo;
     } catch (e) {
       this.logError('getVideoStream', e);
-      if (this.defaultCameraId && targetId !== this.defaultCameraId) {
+      for (const fb of fallbacks) {
         try {
-          const fbCam = this.getVideoCamera(this.defaultCameraId);
-          return await this.tryGetStreamWithFallback(fbCam, requestOptions);
-        } catch (e2) {
-          this.logError('getVideoStream.fallback', e2);
+          const mo = await this.tryGetStreamWithFallback(fb.camera, requestOptions);
+          if (this.currentActiveCameraId !== fb.id) this.currentActiveCameraId = fb.id;
+          return mo;
+        } catch (inner) {
+          this.logError('getVideoStream.fallback', inner);
         }
       }
       throw e;
     }
-  }
-
-  private pickTargetId(): string {
-    let targetId = this.currentActiveCameraId || this.defaultCameraId;
-    if (!targetId && this.monitoredCameraIds?.length) targetId = this.monitoredCameraIds[0];
-    if (!targetId) throw new Error('No target camera');
-    return targetId;
-  }
-
-  private getVideoCamera(id: string): VideoCamera {
-    const sm = getSystemManager();
-    const devAny = sm?.getDeviceById?.(id);
-    const ifaces = getDeviceInterfaces(id);
-    if (!devAny) throw new Error('target device missing');
-    if (!ifaces.includes(ScryptedInterface.VideoCamera)) throw new Error('target not a VideoCamera');
-    return devAny as unknown as VideoCamera;
   }
 
   private buildRequestOptions(base?: RequestMediaStreamOptions): RequestMediaStreamOptions {
@@ -1470,6 +1538,34 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       }
     }
     throw lastErr || new Error('no stream');
+  }
+
+  private enumerateVideoCameraCandidates(): Array<{ id: string; camera: VideoCamera }> {
+    const visited = new Set<string>();
+    const out: Array<{ id: string; camera: VideoCamera }> = [];
+    const ids = [this.currentActiveCameraId, this.defaultCameraId, ...(this.monitoredCameraIds || [])];
+    for (const id of ids) {
+      if (!id || visited.has(id)) continue;
+      visited.add(id);
+      const cam = this.tryResolveVideoCamera(id);
+      if (cam) out.push({ id, camera: cam });
+    }
+    return out;
+  }
+
+  private tryResolveVideoCamera(id: string | undefined): VideoCamera | undefined {
+    if (!id) return undefined;
+    try {
+      const sm = getSystemManager();
+      const devAny = sm?.getDeviceById?.(id);
+      if (!devAny) return undefined;
+      const ifaces = getDeviceInterfaces(id);
+      if (ifaces.includes(ScryptedInterface.VideoCamera)) return devAny as unknown as VideoCamera;
+      if (typeof (devAny as any)?.getVideoStream === 'function') return devAny as unknown as VideoCamera;
+    } catch (e) {
+      this.logError('tryResolveVideoCamera', e);
+    }
+    return undefined;
   }
 
   private async convertMediaObjectToLocalUrl(mediaObject: MediaObject, mime = 'video/mp4') {
@@ -1599,7 +1695,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       endpointPath: this.persistedEndpointPath,
       endpointAuthPath: this.persistedEndpointAuthPath,
       failedListenerIds: this.failedListenerIds,
-      droppedMonitoredIds: this.droppedMonitoredIds,
       errorLog: this.errorLog.slice(-20),
       rebroadcastDeviceId: this.rebroadcastDeviceId,
       settings: {

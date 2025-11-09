@@ -207,25 +207,6 @@ function getDeviceInterfaces(id: string): string[] {
   return [];
 }
 
-function deviceSupportsObjectDetection(id: string): boolean {
-  const ifaces = getDeviceInterfaces(id);
-  if (!ifaces.length) return true;
-  return ifaces.includes(ScryptedInterface.ObjectDetector);
-}
-
-function deviceSupportsVideo(id: string): boolean {
-  if (!id) return false;
-  const ifaces = getDeviceInterfaces(id);
-  if (ifaces.includes(ScryptedInterface.VideoCamera)) return true;
-  try {
-    const sm = getSystemManager();
-    const dev = sm?.getDeviceById?.(id);
-    return !!dev && typeof (dev as any)?.getVideoStream === 'function';
-  } catch {
-    return false;
-  }
-}
-
 function parseDeviceChoice(v: string): string {
   const m = /\(([^)]+)\)$/.exec(v);
   if (m && m[1]) {
@@ -526,7 +507,8 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         for (const id of uniqueSelected) {
           if (!id) continue;
           const resolved = this.resolveDeviceId(id) || id;
-          if (deviceSupportsObjectDetection(resolved)) {
+          const ifaces = getDeviceInterfaces(resolved);
+          if (ifaces.includes(ScryptedInterface.ObjectDetector)) {
             valid.push(resolved);
           }
         }
@@ -542,8 +524,9 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         const id = raw ? parseDeviceChoice(raw) : '';
         const normalized = id ? this.resolveDeviceId(id) || id : undefined;
         if (normalized) {
-          const isDetector = deviceSupportsObjectDetection(normalized);
-          const isVideo = deviceSupportsVideo(normalized);
+          const ifaces = getDeviceInterfaces(normalized);
+          const isDetector = ifaces.includes(ScryptedInterface.ObjectDetector);
+          const isVideo = ifaces.includes(ScryptedInterface.VideoCamera);
           if (isDetector && isVideo) {
             if (!this.monitoredCameraIds.includes(normalized)) {
               this.monitoredCameraIds = [...this.monitoredCameraIds, normalized];
@@ -584,19 +567,13 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           (this.monitoredCameraIds.length && !this.monitoredCameraIds.includes(this.defaultCameraId))) &&
         this.monitoredCameraIds.length
       ) {
-        const firstVideo = this.monitoredCameraIds.find((id) => deviceSupportsVideo(id));
-        if (firstVideo) {
-          this.defaultCameraId = firstVideo;
-          (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
-        } else {
-          this.defaultCameraId = undefined;
-          try {
-            (this as any).storage.removeItem?.('defaultCamera');
-          } catch {}
-          if (!(this as any).storage.removeItem) {
-            (this as any).storage.setItem('defaultCamera', '');
-          }
-        }
+        const firstVideo = this.monitoredCameraIds.find((id) => {
+          const ifaces = getDeviceInterfaces(id);
+          return ifaces.includes(ScryptedInterface.VideoCamera);
+        });
+        const fallback = firstVideo || this.monitoredCameraIds[0];
+        this.defaultCameraId = fallback;
+        (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
       }
 
       if (!this.monitoredCameraIds.length) {
@@ -694,7 +671,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
       // After user changes monitored list, make sure default is sane
       if ((!this.defaultCameraId || !this.monitoredCameraIds.includes(this.defaultCameraId)) && this.monitoredCameraIds.length) {
-        const vid = this.monitoredCameraIds.find((id) => deviceSupportsVideo(id));
+        const vid = this.monitoredCameraIds.find((id) => this.deviceHasVideoCapability(id));
         if (vid) {
           this.defaultCameraId = vid;
           (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
@@ -721,25 +698,26 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   async getSettings(): Promise<Setting[]> {
     try {
       const devices = listSystemDevices();
-      const detectionDevices = devices.filter((d) => {
-        if (d.id === this.id) return false;
-        if (!deviceSupportsObjectDetection(d.id)) return false;
-        return deviceSupportsVideo(d.id);
-      });
+      const detectionDevices = devices.filter(
+        (d) => d.id !== this.id && d.interfaces.includes(ScryptedInterface.ObjectDetector)
+      );
       const objectDetectorFilter = `interface:${ScryptedInterface.ObjectDetector}`;
 
-      const detectorIdSet = new Set(detectionDevices.map((d) => d.id));
-      const monitoredIdList = this.monitoredCameraIds.filter(Boolean);
-      const monitoredIdsInPicker = monitoredIdList.filter((id) => detectorIdSet.has(id));
+      const detectionSet = new Set(detectionDevices.map((d) => d.id));
+      const monitoredIds = this.monitoredCameraIds.filter(Boolean);
+      const monitoredInPicker = monitoredIds.filter((id) => detectionSet.has(id));
+      const missingMonitored = monitoredIds.filter((id) => id && !detectionSet.has(id));
 
       const defaultId =
         this.defaultCameraId &&
-        detectorIdSet.has(this.defaultCameraId) &&
-        monitoredIdsInPicker.includes(this.defaultCameraId)
+        detectionSet.has(this.defaultCameraId) &&
+        monitoredInPicker.includes(this.defaultCameraId)
           ? this.defaultCameraId
           : undefined;
 
-      const settings: Setting[] = [];
+      const detectionSet = new Set(detectionDevices.map((d) => d.id));
+      const monitoredIds = this.monitoredCameraIds.filter(Boolean);
+      const monitoredInPicker = monitoredIds.filter((id) => detectionSet.has(id));
 
       settings.push(
         {
@@ -748,7 +726,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           type: 'device',
           multiple: true,
           deviceFilter: objectDetectorFilter,
-          value: monitoredIdsInPicker.length ? monitoredIdsInPicker : undefined,
+          value: monitoredInPicker,
           placeholder: 'Select monitored cameras',
         },
         {
@@ -756,7 +734,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           key: 'defaultCamera',
           type: 'device',
           deviceFilter: objectDetectorFilter,
-          value: defaultId,
+          value: defaultId || '',
           placeholder: 'Choose a default camera',
         },
         {
@@ -766,6 +744,17 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           value: this.autoDetectObjectDetectors,
         },
       );
+
+      if (missingMonitored.length) {
+        settings.push({
+          title: '⚠️ Missing monitored cameras',
+          key: 'monitoredCamerasMissing',
+          type: 'string',
+          readonly: true,
+          description: 'These saved entries no longer expose ObjectDetector and are ignored.',
+          value: missingMonitored.join(', '),
+        });
+      }
 
       // rest: detection etc.
       const normalizedDetectionString = this.detectionClasses.join(',');
@@ -898,8 +887,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         this.defaultCameraId = parsedDefault ? this.resolveDeviceId(parsedDefault) || parsedDefault : undefined;
       }
 
-      this.pruneMonitoredCamerasWithoutDetectors();
-
       const classesRaw = s.getItem('detectionClasses');
       if (classesRaw) {
         try {
@@ -1000,12 +987,9 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         const normalized = this.normalizeDeviceIdList(ids);
         this.monitoredCameraIds = normalized;
         (this as any).storage.setItem('monitoredCameras', JSON.stringify(normalized));
-        if (!this.defaultCameraId || !deviceSupportsVideo(this.defaultCameraId)) {
-          const vid = normalized.find((id) => deviceSupportsVideo(id));
-          if (vid) {
-            this.defaultCameraId = vid;
-            (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
-          }
+        if (!this.defaultCameraId) {
+          const vid = normalized.find((id) => getDeviceInterfaces(id).includes(ScryptedInterface.VideoCamera));
+          this.defaultCameraId = vid || normalized[0];
         }
       }
     } catch (e) {
@@ -1022,7 +1006,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
       for (const id of this.monitoredCameraIds) {
         if (!id) continue;
-        if (deviceSupportsObjectDetection(id)) {
+        if (this.deviceHasObjectDetector(id)) {
           keep.push(id);
           continue;
         }
@@ -1034,12 +1018,21 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       this.monitoredCameraIds = keep;
       (this as any).storage.setItem('monitoredCameras', JSON.stringify(keep));
 
-      if (this.defaultCameraId && !keep.includes(this.defaultCameraId)) {
-        if (keep.length) {
-          const nextDefault = keep.find((nextId) => deviceSupportsVideo(nextId));
-          if (nextDefault) {
-            this.defaultCameraId = nextDefault;
-            (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
+        if (this.defaultCameraId && !keep.includes(this.defaultCameraId)) {
+          if (keep.length) {
+            const nextDefault = keep.find((nextId) => this.deviceHasVideoCapability(nextId));
+            if (nextDefault) {
+              this.defaultCameraId = nextDefault;
+              (this as any).storage.setItem('defaultCamera', this.defaultCameraId);
+            } else {
+              this.defaultCameraId = undefined;
+              try {
+                (this as any).storage.removeItem?.('defaultCamera');
+              } catch {}
+              if (!(this as any).storage.removeItem) {
+                (this as any).storage.setItem('defaultCamera', '');
+              }
+            }
           } else {
             this.defaultCameraId = undefined;
             try {
@@ -1049,16 +1042,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
               (this as any).storage.setItem('defaultCamera', '');
             }
           }
-        } else {
-          this.defaultCameraId = undefined;
-          try {
-            (this as any).storage.removeItem?.('defaultCamera');
-          } catch {}
-          if (!(this as any).storage.removeItem) {
-            (this as any).storage.setItem('defaultCamera', '');
-          }
         }
-      }
     } catch (e) {
       this.logError('pruneMonitoredCamerasWithoutDetectors', e);
     }

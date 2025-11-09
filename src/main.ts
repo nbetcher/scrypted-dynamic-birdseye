@@ -715,7 +715,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
   async getSettings(): Promise<Setting[]> {
     try {
-      const settings: Setting[] = [];
       const devices = listSystemDevices();
       const detectionDevices = devices.filter(
         (d) => d.id !== this.id && d.interfaces.includes(ScryptedInterface.ObjectDetector)

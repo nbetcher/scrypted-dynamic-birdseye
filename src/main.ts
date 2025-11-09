@@ -207,6 +207,24 @@ function getDeviceInterfaces(id: string): string[] {
   return [];
 }
 
+function deviceSupportsInterface(id: string | undefined, iface: ScryptedInterface): boolean {
+  if (!id) return false;
+  try {
+    const interfaces = getDeviceInterfaces(id);
+    return interfaces.includes(iface);
+  } catch {
+    return false;
+  }
+}
+
+function deviceSupportsVideo(id: string | undefined): boolean {
+  return deviceSupportsInterface(id, ScryptedInterface.VideoCamera);
+}
+
+function deviceSupportsObjectDetection(id: string | undefined): boolean {
+  return deviceSupportsInterface(id, ScryptedInterface.ObjectDetector);
+}
+
 function parseDeviceChoice(v: string): string {
   const m = /\(([^)]+)\)$/.exec(v);
   if (m && m[1]) {
@@ -368,6 +386,14 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
   constructor(nativeId?: string) {
     super(nativeId);
     this.safeInit();
+  }
+
+  private deviceHasVideoCapability(id: string | undefined): boolean {
+    return deviceSupportsVideo(id);
+  }
+
+  private deviceHasObjectDetector(id: string | undefined): boolean {
+    return deviceSupportsObjectDetection(id);
   }
 
   private normalizeDetectionClasses(list: Array<string>): string[] {
@@ -697,6 +723,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
   async getSettings(): Promise<Setting[]> {
     try {
+      const settings: Setting[] = [];
       const devices = listSystemDevices();
       const detectionDevices = devices.filter(
         (d) => d.id !== this.id && d.interfaces.includes(ScryptedInterface.ObjectDetector)
@@ -714,10 +741,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         monitoredInPicker.includes(this.defaultCameraId)
           ? this.defaultCameraId
           : undefined;
-
-      const detectionSet = new Set(detectionDevices.map((d) => d.id));
-      const monitoredIds = this.monitoredCameraIds.filter(Boolean);
-      const monitoredInPicker = monitoredIds.filter((id) => detectionSet.has(id));
 
       settings.push(
         {

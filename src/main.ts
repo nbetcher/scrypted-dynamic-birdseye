@@ -978,9 +978,10 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       const devices = listSystemDevices();
       const ids: string[] = [];
       for (const d of devices) {
-        if (d.interfaces.includes(ScryptedInterface.ObjectDetector)) {
-          ids.push(d.id);
-        }
+        if (!d?.id) continue;
+        if (!deviceSupportsObjectDetection(d.id)) continue;
+        if (!deviceSupportsVideo(d.id)) continue;
+        ids.push(d.id);
       }
       if (ids.length) {
         const normalized = this.normalizeDeviceIdList(ids);

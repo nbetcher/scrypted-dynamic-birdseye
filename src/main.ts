@@ -70,7 +70,7 @@ const DEFAULT_HEIGHT = 1080;
 // 2 Mbps target
 const DEFAULT_BITRATE = 2_000_000;
 
-const DETECTION_CLASS_PRESETS = ['person', 'vehicle', 'person,vehicle', 'package'];
+const DETECTION_CLASS_PRESETS = ['person', 'vehicle', 'package'];
 
 /* --------------------------------- Types ----------------------------------- */
 
@@ -222,7 +222,11 @@ function deviceSupportsVideo(id: string | undefined): boolean {
 }
 
 function deviceSupportsObjectDetection(id: string | undefined): boolean {
-  return deviceSupportsInterface(id, ScryptedInterface.ObjectDetector);
+  if (!id) return false;
+  return (
+    deviceSupportsInterface(id, ScryptedInterface.ObjectDetector) ||
+    deviceSupportsInterface(id, ScryptedInterface.ObjectDetection)
+  );
 }
 
 function parseDeviceChoice(v: string): string {
@@ -392,8 +396,16 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     return deviceSupportsVideo(id);
   }
 
-  private deviceHasObjectDetector(id: string | undefined): boolean {
+  private deviceHasDetectionCapability(id: string | undefined): boolean {
     return deviceSupportsObjectDetection(id);
+  }
+
+  private deviceHasObjectDetectorInterface(id: string | undefined): boolean {
+    return deviceSupportsInterface(id, ScryptedInterface.ObjectDetector);
+  }
+
+  private deviceHasObjectDetectionInterface(id: string | undefined): boolean {
+    return deviceSupportsInterface(id, ScryptedInterface.ObjectDetection);
   }
 
   private normalizeDetectionClasses(list: Array<string>): string[] {
@@ -431,6 +443,85 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     } catch (e) {
       this.logError('applyDetectionClasses', e);
     }
+  }
+
+  private async collectDetectionClassChoices(deviceIds: string[]): Promise<string[]> {
+    const choices = new Set<string>();
+    const sm = getSystemManager();
+
+    const pushClass = (entry: any) => {
+      if (!entry) return;
+      if (typeof entry === 'string') {
+        const normalized = entry.trim().toLowerCase();
+        if (normalized) choices.add(normalized);
+        return;
+      }
+
+      if (typeof entry?.name === 'string') {
+        pushClass(entry.name);
+        return;
+      }
+
+      if (typeof entry?.label === 'string') {
+        pushClass(entry.label);
+        return;
+      }
+
+      if (Array.isArray(entry?.classes)) {
+        for (const nested of entry.classes) pushClass(nested);
+        return;
+      }
+
+      if (typeof entry === 'object') {
+        for (const value of Object.values(entry)) pushClass(value);
+      }
+    };
+
+    const absorb = (list: any) => {
+      if (!list) return;
+      if (Array.isArray(list)) {
+        for (const entry of list) pushClass(entry);
+        return;
+      }
+      pushClass(list);
+    };
+
+    await Promise.all(
+      deviceIds.filter(Boolean).map(async (id) => {
+        try {
+          const device: any = sm?.getDeviceById?.(id);
+          if (!device) return;
+
+          if (typeof device?.getObjectTypes === 'function') {
+            const types = await device.getObjectTypes();
+            absorb((types as any)?.classes);
+          }
+
+          if (typeof device?.getDetectionModel === 'function') {
+            const model = await device.getDetectionModel();
+            absorb((model as any)?.classes);
+          }
+
+          if (typeof device?.getDetectionTypes === 'function') {
+            const detTypes = await device.getDetectionTypes();
+            absorb((detTypes as any)?.classes);
+          }
+        } catch (e) {
+          console.warn('collectDetectionClassChoices', id, e);
+        }
+      })
+    );
+
+    for (const preset of DETECTION_CLASS_PRESETS) {
+      const normalized = this.normalizeDetectionClasses(preset.split(','));
+      for (const entry of normalized) choices.add(entry);
+    }
+
+    for (const entry of this.detectionClasses) {
+      if (entry) choices.add(entry);
+    }
+
+    return Array.from(choices).sort();
   }
 
   /* ------------------------------ Lifecycle -------------------------------- */
@@ -527,17 +618,24 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
         const uniqueSelected = Array.from(new Set(selected));
         const valid: string[] = [];
+        const missingVideo: string[] = [];
         for (const id of uniqueSelected) {
           if (!id) continue;
           const resolved = this.resolveDeviceId(id) || id;
-          if (deviceSupportsObjectDetection(resolved)) {
-            valid.push(resolved);
-          }
+          if (!deviceSupportsObjectDetection(resolved)) continue;
+          valid.push(resolved);
+          if (!deviceSupportsVideo(resolved)) missingVideo.push(resolved);
         }
 
         this.monitoredCameraIds = Array.from(new Set(valid));
         (this as any).storage.setItem('monitoredCameras', JSON.stringify(this.monitoredCameraIds));
         needListenerRefresh = true;
+        if (missingVideo.length) {
+          this.console?.warn?.(
+            '[dynamic-birdseye] monitored cameras missing VideoCamera capability:',
+            missingVideo.join(', ')
+          );
+        }
         // if default is missing but we have at least one monitored, set it later below
       }
 
@@ -546,7 +644,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         const id = raw ? parseDeviceChoice(raw) : '';
         const normalized = id ? this.resolveDeviceId(id) || id : undefined;
         if (normalized) {
-          const isDetector = this.deviceHasObjectDetector(normalized);
+          const isDetector = this.deviceHasDetectionCapability(normalized);
           const isVideo = this.deviceHasVideoCapability(normalized);
           if (isDetector && isVideo) {
             if (!this.monitoredCameraIds.includes(normalized)) {
@@ -608,11 +706,6 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         this.applyDetectionClassesFromInput(values['detectionClasses']);
       }
 
-      if (values['detectionClassesPreset'] !== undefined) {
-        const preset = String(values['detectionClassesPreset'] || '').trim();
-        if (preset) this.applyDetectionClassesFromInput(preset.split(','));
-      }
-
       if (values['smoothingFactor'] !== undefined) {
         const n = Number(values['smoothingFactor']);
         this.detectionEMAAlpha = Number.isFinite(n) && n >= 0 && n <= 1 ? n : this.detectionEMAAlpha;
@@ -650,7 +743,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       }
 
       if (values['codecPreference'] !== undefined) {
-        const v = String(values['codecPreference'] || 'auto');
+        const v = String(values['codecPreference'] || 'auto').toLowerCase();
         this.codecPreference = v === 'h264' || v === 'h265' ? (v as any) : 'auto';
         (this as any).storage.setItem('codecPreference', this.codecPreference);
       }
@@ -717,20 +810,38 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
     try {
       const devices = listSystemDevices();
       const detectionDevices = devices.filter(
-        (d) => d.id !== this.id && d.interfaces.includes(ScryptedInterface.ObjectDetector)
+        (d) =>
+          d.id !== this.id &&
+          (d.interfaces.includes(ScryptedInterface.ObjectDetector) ||
+            d.interfaces.includes(ScryptedInterface.ObjectDetection))
       );
-      const objectDetectorFilter = `interface:${ScryptedInterface.ObjectDetector}`;
+      const detectionDeviceFilter = function (test: { interfaces?: string[] | { [k: string]: any } }) {
+        try {
+          const interfaces: string[] = Array.isArray(test?.interfaces)
+            ? (test?.interfaces as string[])
+            : Object.keys((test?.interfaces as any) || {});
+          return interfaces.includes('ObjectDetector') || interfaces.includes('ObjectDetection');
+        } catch {
+          return false;
+        }
+      };
 
       const settings: Setting[] = [];
       const detectionSet = new Set(detectionDevices.map((d) => d.id));
+      const videoCapableSet = new Set(
+        detectionDevices.filter((d) => d.interfaces.includes(ScryptedInterface.VideoCamera)).map((d) => d.id)
+      );
+
       const monitoredIds = this.monitoredCameraIds.filter(Boolean);
       const monitoredInPicker = monitoredIds.filter((id) => detectionSet.has(id));
       const missingMonitored = monitoredIds.filter((id) => id && !detectionSet.has(id));
+      const monitoredMissingVideo = monitoredInPicker.filter((id) => !videoCapableSet.has(id));
 
       const defaultId =
         this.defaultCameraId &&
         detectionSet.has(this.defaultCameraId) &&
-        monitoredInPicker.includes(this.defaultCameraId)
+        monitoredInPicker.includes(this.defaultCameraId) &&
+        videoCapableSet.has(this.defaultCameraId)
           ? this.defaultCameraId
           : undefined;
 
@@ -740,20 +851,20 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           key: 'monitoredCameras',
           type: 'device',
           multiple: true,
-          deviceFilter: objectDetectorFilter,
+          deviceFilter: detectionDeviceFilter as any,
           value: monitoredInPicker,
-          placeholder: 'Select monitored cameras',
+          placeholder: 'Select monitored cameras (ObjectDetector/ObjectDetection)',
         },
         {
           title: 'Default Camera',
           key: 'defaultCamera',
           type: 'device',
-          deviceFilter: objectDetectorFilter,
+          deviceFilter: detectionDeviceFilter as any,
           value: defaultId || '',
           placeholder: 'Choose a default camera',
         },
         {
-          title: 'Auto-detect ObjectDetector cameras',
+          title: 'Auto-detect detection-capable cameras',
           key: 'autoDetectObjectDetectors',
           type: 'boolean',
           value: this.autoDetectObjectDetectors,
@@ -766,31 +877,36 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           key: 'monitoredCamerasMissing',
           type: 'string',
           readonly: true,
-          description: 'These saved entries no longer expose ObjectDetector and are ignored.',
+          description: 'These saved entries no longer expose ObjectDetector/ObjectDetection and are ignored.',
           value: missingMonitored.join(', '),
         });
       }
 
+      if (monitoredMissingVideo.length) {
+        settings.push({
+          title: '⚠️ Monitored cameras missing VideoCamera',
+          key: 'monitoredCamerasMissingVideo',
+          type: 'string',
+          readonly: true,
+          description: 'These saved entries do not currently expose VideoCamera and may not stream video.',
+          value: monitoredMissingVideo.join(', '),
+        });
+      }
+
       // rest: detection etc.
-      const normalizedDetectionString = this.detectionClasses.join(',');
-      const presetValue = DETECTION_CLASS_PRESETS.find((preset) => {
-        const normalizedPreset = this.normalizeDetectionClasses(preset.split(','));
-        return normalizedPreset.join(',') === normalizedDetectionString;
-      }) || '';
+      const detectionClassChoices = await this.collectDetectionClassChoices(detectionDevices.map((d) => d.id));
 
       settings.push(
         {
-          title: 'Detection class preset',
-          key: 'detectionClassesPreset',
-          type: 'string',
-          choices: DETECTION_CLASS_PRESETS,
-          value: presetValue,
-        },
-        {
-          title: 'Detection classes (comma separated)',
+          title: 'Detection classes',
           key: 'detectionClasses',
           type: 'string',
-          value: this.detectionClasses.join(', '),
+          multiple: true,
+          choices: detectionClassChoices,
+          value: this.detectionClasses,
+          placeholder: detectionClassChoices.length
+            ? 'Select detection classes'
+            : 'No detection classes reported',
         },
         {
           title: 'Smoothing factor (EMA alpha 0..1)',
@@ -832,8 +948,8 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
           title: 'Video codec preference',
           key: 'codecPreference',
           type: 'string',
-          value: this.codecPreference,
-          description: 'auto|h264|h265',
+          choices: ['Auto', 'H264', 'H265'],
+          value: this.codecPreference.toUpperCase(),
         },
         {
           title: 'Prebuffer (ms, hint)',
@@ -949,8 +1065,12 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       }
 
       const codecRaw = s.getItem('codecPreference');
-      if (codecRaw && (codecRaw === 'h264' || codecRaw === 'h265' || codecRaw === 'auto'))
-        this.codecPreference = codecRaw as any;
+      if (codecRaw) {
+        const normalizedCodec = String(codecRaw).toLowerCase();
+        if (normalizedCodec === 'h264' || normalizedCodec === 'h265' || normalizedCodec === 'auto') {
+          this.codecPreference = normalizedCodec as any;
+        }
+      }
 
       const priRaw = s.getItem('cameraPriorities');
       if (priRaw) {
@@ -1021,7 +1141,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
       for (const id of this.monitoredCameraIds) {
         if (!id) continue;
-        if (this.deviceHasObjectDetector(id)) {
+        if (this.deviceHasDetectionCapability(id) && this.deviceHasVideoCapability(id)) {
           keep.push(id);
           continue;
         }
@@ -1088,10 +1208,15 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
     for (const id of this.monitoredCameraIds) {
       try {
-        // don’t pre-check interfaces; just try to listen
+        const detectionInterface = this.resolveDetectionListenerInterface(id);
+        if (!detectionInterface) {
+          this.failedListenerIds.push(id);
+          continue;
+        }
+
         const listener = sm?.listenDevice?.(
           id,
-          ScryptedInterface.ObjectDetector,
+          detectionInterface,
           (source: any, details: any, data: any) => {
             try {
               this.handleObjectDetection(source, details, data as ObjectsDetected);
@@ -1138,9 +1263,10 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         const dev = sm?.getDeviceById?.(id);
         const ifaces = getDeviceInterfaces(id);
         if (!dev) continue;
-        if (!ifaces.includes(ScryptedInterface.ObjectDetector)) continue;
+        const detectionInterface = this.resolveDetectionListenerInterface(id, ifaces);
+        if (!detectionInterface) continue;
 
-        const listener = sm?.listenDevice?.(id, ScryptedInterface.ObjectDetector, (source: any, details: any, data: any) => {
+        const listener = sm?.listenDevice?.(id, detectionInterface, (source: any, details: any, data: any) => {
           try {
             this.handleObjectDetection(source, details, data as ObjectsDetected);
           } catch (e) {
@@ -1160,6 +1286,24 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
       this.failedListenerIds = this.failedListenerIds.filter((x) => !recovered.includes(x));
       this.persistFailedListeners();
     }
+  }
+
+  private resolveDetectionListenerInterface(
+    id: string | undefined,
+    precomputed?: string[]
+  ): ScryptedInterface | undefined {
+    if (!id) return undefined;
+    try {
+      if (Array.isArray(precomputed)) {
+        if (precomputed.includes(ScryptedInterface.ObjectDetector)) return ScryptedInterface.ObjectDetector;
+        if (precomputed.includes(ScryptedInterface.ObjectDetection)) return ScryptedInterface.ObjectDetection;
+      }
+      if (this.deviceHasObjectDetectorInterface(id)) return ScryptedInterface.ObjectDetector;
+      if (this.deviceHasObjectDetectionInterface(id)) return ScryptedInterface.ObjectDetection;
+    } catch (e) {
+      this.logError('resolveDetectionListenerInterface', e);
+    }
+    return undefined;
   }
 
   /* ----------------------------- Persistence ------------------------------- */
@@ -1279,13 +1423,98 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
   /* ------------------------------ Detection flow --------------------------- */
 
+  private coerceDetectionArray(eventData: any): Array<{ className?: string; score?: number }> {
+    const out: Array<{ className?: string; score?: number }> = [];
+
+    const parseMaybeNumber = (value: any): number | undefined => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : undefined;
+    };
+
+    const pushNormalized = (entry: any) => {
+      if (!entry) return;
+      if (typeof entry === 'string') {
+        const trimmed = entry.trim();
+        if (!trimmed) return;
+        out.push({ className: trimmed, score: 1 });
+        return;
+      }
+
+      if (Array.isArray(entry)) {
+        for (const nested of entry) pushNormalized(nested);
+        return;
+      }
+
+      const maybeClassName =
+        (typeof entry?.className === 'string' && entry.className) ||
+        (typeof entry?.label === 'string' && entry.label) ||
+        (typeof entry?.detectionClass === 'string' && entry.detectionClass) ||
+        (typeof entry?.type === 'string' && entry.type) ||
+        (typeof entry?.classification?.className === 'string' && entry.classification.className) ||
+        (typeof entry?.detection?.className === 'string' && entry.detection.className);
+
+      if (!maybeClassName) {
+        if (Array.isArray(entry?.classes)) {
+          for (const cls of entry.classes) pushNormalized(cls);
+        } else if (typeof entry === 'object') {
+          for (const value of Object.values(entry)) pushNormalized(value);
+        }
+        return;
+      }
+
+      const scoreRaw =
+        parseMaybeNumber(entry?.score) ??
+        parseMaybeNumber(entry?.confidence) ??
+        parseMaybeNumber(entry?.probability);
+      const score = scoreRaw !== undefined ? Math.max(0, Math.min(1, scoreRaw)) : 1;
+
+      out.push({ className: String(maybeClassName), score });
+    };
+
+    if (Array.isArray(eventData?.detections)) {
+      for (const det of eventData.detections) pushNormalized(det);
+    } else if (Array.isArray(eventData)) {
+      for (const det of eventData) pushNormalized(det);
+    } else if (Array.isArray(eventData?.objects)) {
+      for (const det of eventData.objects) pushNormalized(det);
+    } else if (Array.isArray(eventData?.classes)) {
+      for (const det of eventData.classes) pushNormalized(det);
+    } else if (eventData && typeof eventData === 'object') {
+      pushNormalized(eventData);
+    }
+
+    return out;
+  }
+
+  private normalizeEventDeviceId(candidate: any): string | undefined {
+    if (candidate === undefined || candidate === null) return undefined;
+    const raw = String(candidate).trim();
+    if (!raw) return undefined;
+    return this.resolveDeviceId(raw) || raw;
+  }
+
   private handleObjectDetection(eventSource: any, _details: any, eventData: ObjectsDetected) {
     try {
-      const deviceId = eventSource?.id || _details?.id;
-      const deviceName = eventSource?.name || _details?.name || deviceId || 'unknown';
+      const candidateIds = [
+        this.normalizeEventDeviceId((eventData as any)?.['sourceId']),
+        this.normalizeEventDeviceId((eventData as any)?.['source']),
+        this.normalizeEventDeviceId((eventData as any)?.['deviceId']),
+        this.normalizeEventDeviceId(eventSource?.id),
+        this.normalizeEventDeviceId((eventSource as any)?.['nativeId']),
+        this.normalizeEventDeviceId((eventSource as any)?.['sourceDevice']?.id),
+        this.normalizeEventDeviceId((_details as any)?.['eventSourceId']),
+        this.normalizeEventDeviceId((_details as any)?.['deviceId']),
+        this.normalizeEventDeviceId(_details?.id),
+      ].filter(Boolean) as string[];
+
+      const deviceId =
+        candidateIds.find((id) => this.deviceHasVideoCapability(id) || this.monitoredCameraIds.includes(id)) ||
+        candidateIds[0];
       if (!deviceId) return;
 
-      const detections = Array.isArray(eventData?.detections) ? eventData.detections : [];
+      const deviceName = eventSource?.name || _details?.name || deviceId;
+
+      const detections = this.coerceDetectionArray(eventData);
       if (!detections.length) {
         if (this.activeDetections.has(deviceId)) {
           this.activeDetections.delete(deviceId);
@@ -1294,14 +1523,13 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         return;
       }
 
-      // build relevant list but do NOT emit className: undefined (to appease exactOptionalPropertyTypes)
       const relevant: Array<{ score: number; className?: string }> = [];
-      for (const d of detections) {
-        if (!d) continue;
-        const cnameRaw = typeof d.className === 'string' ? d.className : undefined;
+      for (const detection of detections) {
+        if (!detection) continue;
+        const cnameRaw = typeof detection.className === 'string' ? detection.className : undefined;
         const cname = cnameRaw ? cnameRaw.toLowerCase() : undefined;
         if (!cname || !this.detectionClasses.includes(cname)) continue;
-        const scoreNum = Math.max(0, Math.min(1, Number(d.score || 0)));
+        const scoreNum = Math.max(0, Math.min(1, Number(detection.score ?? 0)));
         const obj: { score: number; className?: string } = { score: scoreNum };
         if (cnameRaw) obj.className = cnameRaw;
         relevant.push(obj);
@@ -1315,11 +1543,11 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
         return;
       }
 
-      // pick best manually
-      let best: { score: number; className?: string } | undefined = undefined;
-      for (const r of relevant) {
-        if (!best || r.score > best.score) best = r;
+      let best: { score: number; className?: string } | undefined;
+      for (const candidate of relevant) {
+        if (!best || candidate.score > best.score) best = candidate;
       }
+
       if (!best) {
         if (this.activeDetections.has(deviceId)) {
           this.activeDetections.delete(deviceId);

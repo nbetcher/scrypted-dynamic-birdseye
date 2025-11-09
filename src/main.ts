@@ -207,24 +207,22 @@ function getDeviceInterfaces(id: string): string[] {
   return [];
 }
 
-function deviceSupportsVideo(id: string | undefined): boolean {
+function deviceSupportsInterface(id: string | undefined, iface: ScryptedInterface): boolean {
   if (!id) return false;
   try {
-    const ifaces = getDeviceInterfaces(id);
-    return Array.isArray(ifaces) && ifaces.includes(ScryptedInterface.VideoCamera);
+    const interfaces = getDeviceInterfaces(id);
+    return interfaces.includes(iface);
   } catch {
     return false;
   }
 }
 
+function deviceSupportsVideo(id: string | undefined): boolean {
+  return deviceSupportsInterface(id, ScryptedInterface.VideoCamera);
+}
+
 function deviceSupportsObjectDetection(id: string | undefined): boolean {
-  if (!id) return false;
-  try {
-    const ifaces = getDeviceInterfaces(id);
-    return Array.isArray(ifaces) && ifaces.includes(ScryptedInterface.ObjectDetector);
-  } catch {
-    return false;
-  }
+  return deviceSupportsInterface(id, ScryptedInterface.ObjectDetector);
 }
 
 function parseDeviceChoice(v: string): string {
@@ -717,6 +715,7 @@ class BirdseyeDevice extends ScryptedDeviceBase implements VideoCamera, Settings
 
   async getSettings(): Promise<Setting[]> {
     try {
+      const settings: Setting[] = [];
       const devices = listSystemDevices();
       const detectionDevices = devices.filter(
         (d) => d.id !== this.id && d.interfaces.includes(ScryptedInterface.ObjectDetector)
